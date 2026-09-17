@@ -66,6 +66,11 @@ def run(root):
     malformed = root / "malformed.eml"
     malformed.write_bytes(b'MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nBody\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=x.bin\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=!!!!\r\n--b--\r\n')
     assert any("InvalidBase64" in w for w in ef.read_eml(malformed)["warnings"])
+    args.out = str(root / "reviewed-html")
+    args.omit_redundant_plain = True
+    ef.export(args)
+    reviewed = "\n".join(p.extract_text() for p in ef.PdfReader(Path(args.out) / "conversation.pdf").pages)
+    assert "Ship Friday." in reviewed and "Unique plain alternative fact." not in reviewed
 
 
 if __name__ == "__main__":

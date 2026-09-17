@@ -28,7 +28,7 @@ python email_files.py export LATEST.eml --attachments-from OLDER.eml --out OUTPU
 
 ## Verify, then clean up
 
-Inspect PDF text and render representative pages, especially long chains, tables, and non-Latin text, using available PDF tools. Check clipping, missing messages/images, and blank pages; verify attachment/source hashes against the manifest. HTML is reflowed into a readable archive, not a pixel-identical copy. Reuse verified prior outputs on repeat runs.
+Inspect PDF text and render representative pages, especially long chains, tables, and non-Latin text, using available PDF tools. Check clipping, missing messages/images, and blank pages; verify attachment/source hashes against the manifest. HTML is reflowed into a readable archive, not a pixel-identical copy. If plain/HTML alternatives differ only in formatting, verify their text and link/image targets, then use `--omit-redundant-plain` to avoid printing the chain twice. Reuse verified prior outputs on repeat runs.
 
 When cleanup is requested, move **only proven redundant, explicitly scoped files** into a local `.email-organizer-recovery/RUN_ID/` outside the active collection. Log original path, recovery path, SHA-256, retained replacement, and reason in JSON. Verify resolved paths, recheck hashes immediately before moving, preserve relative paths, and never overwrite recovery files. Permanently delete only when expressly requested. Existing cleanup authorization needs no additional confirmation; conversion alone does not authorize removing sources.
 

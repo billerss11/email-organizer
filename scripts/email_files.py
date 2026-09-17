@@ -98,7 +98,7 @@ def read_eml(path):
     compact_html = re.sub(r"\s+", "", text)
     plain_has_extra = is_html and any(re.sub(r"\s+", "", line) not in compact_html for line in plain.splitlines() if line.strip())
     if plain_has_extra:
-        warnings.append("Plain MIME alternative contains additional/different text; included separately in PDF.")
+        warnings.append("Plain MIME alternative contains additional/different text; review both representations.")
     # Base64 defects may only appear after decoding; inspect after all decoding.
     for part in msg.walk():
         if part.defects:
@@ -269,6 +269,10 @@ def export(args):
             by_path[path] = read_eml(path)
             records.append(by_path[path])
     included = [by_path[Path(name).resolve()] for name in args.emls]
+    omit_plain = getattr(args, "omit_redundant_plain", False)
+    if omit_plain:
+        for record in included:
+            record["warnings"] = [w for w in record["warnings"] if not w.startswith("Plain MIME alternative contains")]
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     (out / "attachments").mkdir()
@@ -294,7 +298,7 @@ def export(args):
         header_rows = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in record["headers"].items() if v)
         attachment_rows = "".join("<li>" + html.escape(a["name"]) + f" ({a['bytes']} bytes) - " + html.escape(a["saved_as"]) + "</li>" for a in record["attachments"])
         body = sanitized_body(record)
-        if record["plain_has_extra"]:
+        if record["plain_has_extra"] and not omit_plain:
             body += '<h2>Plain-text alternative with additional content</h2><pre>' + html.escape(record["plain_alternative"]) + '</pre>'
         sections.append('<section><h1>' + html.escape(record["headers"]["Subject"] or "Email") + '</h1><table class="headers">' + header_rows + '</table><article>' + body + '</article>' + ('<h2>Files extracted from this email</h2><ul>' + attachment_rows + '</ul>' if attachment_rows else '') + '</section>')
     all_files = "".join("<li>" + html.escape(name) + "</li>" for name in saved.values())
@@ -324,6 +328,7 @@ pre{white-space:pre-wrap;font-family:inherit;overflow-wrap:anywhere}blockquote{b
     manifest = {"version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
                 "pdf": "conversation.pdf", "pdf_sha256": digest(pdf_path.read_bytes()), "pages": len(reader.pages),
                 "included_sources": [r["path"] for r in included], "sources": [public_record(r) for r in records],
+                "plain_alternative_policy": "omitted_after_content_review" if omit_plain else "preserve_additional_text",
                 "unique_attachments": len(saved), "status": "exported; content/visual review required before cleanup"}
     save_json(out / "manifest.json", manifest)
     return {"pdf": str(pdf_path), "manifest": str(out / "manifest.json"), "pages": len(reader.pages),
@@ -342,6 +347,7 @@ def main():
     e.add_argument("--attachments-from", nargs="*", default=[], help="Older EMLs to preserve sources/attachments from.")
     e.add_argument("--out", required=True, help="New directory; existing directories are never overwritten.")
     e.add_argument("--browser", help="Optional Chrome/Edge executable.")
+    e.add_argument("--omit-redundant-plain", action="store_true", help="Omit plain MIME alternative only after reviewing that HTML preserves its content and link/image targets.")
     args = parser.parse_args()
     try:
         print(json.dumps(scan(args) if args.command == "scan" else export(args), ensure_ascii=False))
