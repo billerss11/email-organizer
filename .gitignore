@@ -7,3 +7,5 @@ outputs/
 .email-organizer-recovery/
 *.eml
 *.pdf
+*.txt
+!requirements.txt

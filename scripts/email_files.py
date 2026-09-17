@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect local EML/PDF files; export EMLs and attachments without changing sources."""
+"""Extract attachments and convert EMLs, including nested emails, to TXT or PDF."""
 import argparse
 import base64
 from email import policy
@@ -15,10 +15,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from urllib.parse import unquote
 
 from bs4 import BeautifulSoup
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 
 def digest(data):
@@ -60,7 +61,7 @@ def read_eml(path):
         part_scopes[id(part)] = scope
         if mime in {"application/ms-tnef", "application/pkcs7-mime", "application/x-pkcs7-mime", "multipart/encrypted", "multipart/signed"}:
             warnings.append(f"Special MIME {mime}: retain original until independently verified.")
-        embedded = mime == "message/rfc822"
+        embedded = mime in {"message/rfc822", "message/global"}
         is_file = bool(part.get_filename()) or part.get_content_disposition() == "attachment"
         if mime in {"text/plain", "text/html"} and not in_attachment and not is_file:
             text_parts.append(part)
@@ -132,6 +133,26 @@ def read_pdf(path):
             "warnings": warnings, "text": text, "attachments": []}
 
 
+def read_text(path):
+    raw = path.read_bytes()
+    encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    warnings = []
+    try:
+        text = raw.decode(encoding)
+    except UnicodeError:
+        text = raw.decode(encoding, errors="replace")
+        warnings.append("TXT decoding needed replacements; inspect original before cleanup.")
+    headers = {}
+    for line in text.splitlines():
+        if not line.strip():
+            break
+        key, separator, value = line.partition(":")
+        if separator and key in {"Subject", "From", "To", "Cc", "Bcc", "Date"}:
+            headers[key] = value.strip()
+    return {"path": str(path), "kind": "txt", "sha256": digest(raw), "headers": headers,
+            "warnings": warnings, "text": text, "attachments": []}
+
+
 def public_record(record):
     result = {k: v for k, v in record.items() if not k.startswith("_") and k not in {"body", "is_html", "text", "plain_alternative", "raw", "attachments"}}
     result["attachments"] = [{k: v for k, v in a.items() if k != "data" and not k.startswith("_")} for a in record.get("attachments", [])]
@@ -146,7 +167,7 @@ def input_files(inputs, recursive):
         for path in paths:
             if path.is_symlink() or any(p in {".git", ".email-organizer-recovery"} for p in path.parts):
                 continue
-            if not path.is_file() or path.suffix.lower() not in {".eml", ".pdf"}:
+            if not path.is_file() or path.suffix.lower() not in {".eml", ".pdf", ".txt"}:
                 continue
             path = path.resolve()
             if path not in seen:
@@ -161,7 +182,7 @@ def scan(args):
     records = []
     for index, path in enumerate(paths, 1):
         try:
-            record = read_eml(path) if path.suffix.lower() == ".eml" else read_pdf(path)
+            record = {".eml": read_eml, ".pdf": read_pdf, ".txt": read_text}[path.suffix.lower()](path)
             text_path = out / f"{index:04d}-{record['sha256'][:12]}.txt"
             text = record["text"]
             if record.get("plain_alternative") and record["plain_alternative"] != text:
@@ -291,35 +312,96 @@ def attachment_target(out, attachment, saved, reserved):
     raise RuntimeError(f"Could not choose a unique attachment name for {name}.")
 
 
-def export(args):
-    first = Path(args.emls[0]).resolve(strict=True)
-    if first.suffix.lower() != ".eml":
-        raise ValueError("Export accepts EML sources only.")
-    out = Path(args.out).resolve(strict=True) if getattr(args, "out", None) else first.parent
-    if not out.is_dir():
-        raise ValueError("--out must be an existing directory.")
-    pdf_name = getattr(args, "pdf_name", None) or (first.stem + ".pdf")
-    if Path(pdf_name).name != pdf_name or Path(pdf_name).suffix.lower() != ".pdf" or safe_name(pdf_name) != pdf_name:
-        raise ValueError("--pdf-name must be a safe basename ending in .pdf.")
-    pdf_path = out / pdf_name
-    # Refuse before parsing or extracting attachments, so a repeated run creates no clutter.
-    if pdf_path.exists():
-        raise FileExistsError(f"Destination PDF already exists: {pdf_path}")
+def pdf_key(records, omit_plain):
+    return digest(json.dumps({"sources": [r["sha256"] for r in records],
+                              "omit_plain": omit_plain, "format": 1}).encode())
 
-    browser = find_browser(getattr(args, "browser", None))
-    records, by_path = [], {}
-    for name in args.emls + args.attachments_from:
-        path = Path(name).resolve(strict=True)
-        if path.suffix.lower() != ".eml":
-            raise ValueError("Export accepts EML sources only.")
-        if path not in by_path:
-            by_path[path] = read_eml(path)
-            records.append(by_path[path])
-    included = [by_path[Path(name).resolve()] for name in args.emls]
-    omit_plain = getattr(args, "omit_redundant_plain", False)
-    if omit_plain:
-        for record in included:
-            record["warnings"] = [w for w in record["warnings"] if not w.startswith("Plain MIME alternative contains")]
+
+def reusable_pdf(path, key):
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        reader = PdfReader(path)
+        return (reader.metadata or {}).get("/EmailOrganizerKey") == key and bool(reader.pages)
+    except Exception:
+        return False
+
+
+def html_text(body):
+    soup = BeautifulSoup(body, "html.parser")
+    for tag in list(soup.find_all(["head", "script", "style"])):
+        tag.decompose()
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for row in reversed(soup.find_all("tr")):
+        cells = row.find_all(["td", "th"], recursive=False)
+        row.replace_with("\n" + "\t".join(cell.get_text(" ", strip=True) for cell in cells) + "\n")
+    for tag in soup.find_all(["p", "div", "blockquote", "li", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        tag.insert_before("\n")
+        tag.append("\n")
+    return "\n".join(line.strip() for line in soup.get_text().splitlines() if line.strip())
+
+
+def text_key(text):
+    # Compare visible MIME text despite generated link/CID wrappers and wrapping.
+    text = re.sub(r"<(?:mailto:|https?://)[^>]*>|\[cid:[^\]]*\]", "", text, flags=re.I)
+    text = re.sub(r"(?m)^\s*>+\s?", "", text)
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).replace("•", "*")
+
+
+def conversation_text(records):
+    sections = []
+    for record in records:
+        headers = "\n".join(f"{key}: {record['headers'][key]}" for key in
+                            ("Subject", "From", "To", "Cc", "Bcc", "Date") if record["headers"][key])
+        plain = record["plain_alternative"]
+        body = plain if plain else (html_text(record["body"]) if record["is_html"] else record["body"])
+        if plain and record["is_html"]:
+            known = text_key(plain)
+            extra = []
+            for line in html_text(record["body"]).splitlines():
+                key = text_key(line)
+                if key and key not in known:
+                    extra.append(line)
+                    known += key
+            if extra:
+                body += "\n\nAdditional text from HTML version:\n" + "\n".join(extra)
+        sections.append(headers + "\n\n" + body.strip())
+    return ("\n\n---\n\n".join(sections).replace("\r\n", "\n").rstrip() + "\n").encode("utf-8")
+
+
+def reusable_text(path, content):
+    return not path.is_symlink() and path.is_file() and path.read_bytes() == content
+
+
+def nested_output_path(out, source, record, reserved, output_format):
+    stem = safe_name(source.stem)[:110]
+    key = pdf_key([record], False) if output_format == "pdf" else conversation_text([record])
+    reusable = reusable_pdf if output_format == "pdf" else reusable_text
+    names = [f"{stem}.{output_format}"] + [f"{stem}-{record['sha256'][:n]}.{output_format}" for n in (8, 16, 64)]
+    for name in names:
+        path = out / name
+        if path not in reserved and (not os.path.lexists(path) or reusable(path, key)):
+            return path
+    raise RuntimeError(f"Could not choose an output name for attached email: {source}")
+
+
+def render_conversation(included, pdf_path, browser, omit_plain=False, output_format="pdf"):
+    if output_format == "txt":
+        content = conversation_text(included)
+        reused = reusable_text(pdf_path, content)
+        if not reused:
+            with pdf_path.open("xb") as destination:
+                destination.write(content)
+        if pdf_path.read_bytes() != content:
+            raise RuntimeError(f"Text output verification failed: {pdf_path}")
+        return {"text": str(pdf_path), "text_sha256": digest(content), "reused": reused}
+    key = pdf_key(included, omit_plain)
+    if reusable_pdf(pdf_path, key):
+        return {"pdf": str(pdf_path), "pdf_sha256": digest(pdf_path.read_bytes()),
+                "pages": len(PdfReader(pdf_path).pages), "reused": True}
+    if os.path.lexists(pdf_path):
+        raise FileExistsError(f"Destination PDF already exists: {pdf_path}")
     sections = []
     for record in included:
         header_rows = "".join(
@@ -345,33 +427,85 @@ pre{white-space:pre-wrap;font-family:inherit;overflow-wrap:anywhere}blockquote{b
         reader = PdfReader(temp_pdf)
         if not "".join(p.extract_text() or "" for p in reader.pages).strip():
             raise RuntimeError("PDF contains no searchable text.")
-        pages = len(reader.pages)
-
-        saved = {}
-        for path in sorted(out.iterdir()):
-            if not path.is_symlink() and path.is_file() and path != pdf_path:
-                saved.setdefault(digest(path.read_bytes()), path)
-        extracted = {}
-        include_inline = getattr(args, "include_inline_images", False)
-        for record in records:
-            for attachment in record["attachments"]:
-                body_image = attachment["mime"].startswith("image/") and attachment["disposition"] != "attachment" and (attachment["inline"] or (attachment["cid"] and attachment["_body_resource"]))
-                if body_image and not include_inline:
-                    continue
-                target = attachment_target(out, attachment, saved, {pdf_path})
-                item = extracted.setdefault(attachment["sha256"], {
-                    "path": str(target), "sha256": attachment["sha256"], "aliases": []})
-                if attachment["name"] not in item["aliases"]:
-                    item["aliases"].append(attachment["name"])
-        if pdf_path.exists():
-            raise FileExistsError(f"Destination PDF already exists: {pdf_path}")
+        writer = PdfWriter(clone_from=reader)
+        writer.add_metadata({"/EmailOrganizerKey": key})
         with pdf_path.open("xb") as destination:
-            destination.write(temp_pdf.read_bytes())
+            writer.write(destination)
+        pages = len(reader.pages)
+    return {"pdf": str(pdf_path), "pdf_sha256": digest(pdf_path.read_bytes()),
+            "pages": pages, "reused": False}
 
-    reader = PdfReader(pdf_path)
-    if not "".join(p.extract_text() or "" for p in reader.pages).strip():
-        raise RuntimeError("PDF contains no searchable text.")
-    return {"pdf": str(pdf_path), "pdf_sha256": digest(pdf_path.read_bytes()), "pages": pages,
+
+def export(args):
+    first = Path(args.emls[0]).resolve(strict=True)
+    if first.suffix.lower() != ".eml":
+        raise ValueError("Export accepts EML sources only.")
+    out = Path(args.out).resolve(strict=True) if getattr(args, "out", None) else first.parent
+    if not out.is_dir():
+        raise ValueError("--out must be an existing directory.")
+    output_format = getattr(args, "format", "txt")
+    if output_format not in {"txt", "pdf"}:
+        raise ValueError("--format must be txt or pdf.")
+    output_name = getattr(args, "output_name", None) or getattr(args, "pdf_name", None) or (first.stem + "." + output_format)
+    if Path(output_name).name != output_name or Path(output_name).suffix.lower() != "." + output_format or safe_name(output_name) != output_name:
+        raise ValueError(f"--output-name must be a safe basename ending in .{output_format}.")
+    output_path = out / output_name
+    if output_format == "pdf" and os.path.lexists(output_path):
+        raise FileExistsError(f"Destination PDF already exists: {output_path}")
+
+    browser = find_browser(getattr(args, "browser", None)) if output_format == "pdf" else None
+    records, by_path = [], {}
+    for name in args.emls + args.attachments_from:
+        path = Path(name).resolve(strict=True)
+        if path.suffix.lower() != ".eml":
+            raise ValueError("Export accepts EML sources only.")
+        if path not in by_path:
+            by_path[path] = read_eml(path)
+            records.append(by_path[path])
+    included = [by_path[Path(name).resolve()] for name in args.emls]
+    omit_plain = output_format == "pdf" and getattr(args, "omit_redundant_plain", False)
+    if omit_plain:
+        for record in included:
+            record["warnings"] = [w for w in record["warnings"] if not w.startswith("Plain MIME alternative contains")]
+
+    if output_format == "txt" and os.path.lexists(output_path) and not reusable_text(output_path, conversation_text(included)):
+        raise FileExistsError(f"Destination TXT differs from this conversation: {output_path}")
+
+    saved = {}
+    for path in sorted(out.iterdir()):
+        if not path.is_symlink() and path.is_file() and path != output_path:
+            saved.setdefault(digest(path.read_bytes()), path)
+    extracted, nested = {}, []
+    seen = {record["sha256"] for record in records}
+    include_inline = getattr(args, "include_inline_images", False)
+    # Appending to this queue also handles .eml files sent as generic binary data.
+    for record in records:
+        for attachment in record["attachments"]:
+            body_image = attachment["mime"].startswith("image/") and attachment["disposition"] != "attachment" and (attachment["inline"] or (attachment["cid"] and attachment["_body_resource"]))
+            if body_image and not include_inline:
+                continue
+            target = attachment_target(out, attachment, saved, {output_path})
+            item = extracted.setdefault(attachment["sha256"], {
+                "path": str(target), "sha256": attachment["sha256"], "aliases": []})
+            if attachment["name"] not in item["aliases"]:
+                item["aliases"].append(attachment["name"])
+            is_email = attachment["mime"] in {"message/rfc822", "message/global"} or attachment["name"].lower().endswith(".eml")
+            if is_email and attachment["sha256"] not in seen:
+                seen.add(attachment["sha256"])
+                child = read_eml(target)
+                records.append(child)
+                nested.append(child)
+
+    result = render_conversation(included, output_path, browser, omit_plain, output_format)
+    nested_results, reserved = [], {output_path}
+    for record in nested:
+        source = Path(record["path"])
+        target = nested_output_path(out, source, record, reserved, output_format)
+        reserved.add(target)
+        # Parent-only review of MIME alternatives must not suppress child content.
+        child_result = render_conversation([record], target, browser, output_format=output_format)
+        nested_results.append({"eml": str(source), **child_result})
+    return {**result, "nested_pdfs" if output_format == "pdf" else "nested_texts": nested_results,
             "sources": [{"path": r["path"], "sha256": r["sha256"]} for r in records],
             "attachments": list(extracted.values()), "unique_attachments": len(extracted),
             "warnings": sorted(set(w for r in records for w in r["warnings"]))}
@@ -380,18 +514,19 @@ pre{white-space:pre-wrap;font-family:inherit;overflow-wrap:anywhere}blockquote{b
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    s = commands.add_parser("scan", help="Read specified EML/PDF files; save evidence without changing sources.")
+    s = commands.add_parser("scan", help="Read specified EML/TXT/PDF files; save temporary evidence without changing sources.")
     s.add_argument("inputs", nargs="+")
     s.add_argument("--recursive", action="store_true", help="Include subfolders of specified directories.")
     s.add_argument("--out", required=True, help="New directory for inventory and extracted text.")
-    e = commands.add_parser("export", help="Write a PDF and unique attachments beside the source EMLs or in another existing folder.")
-    e.add_argument("emls", nargs="+", help="EMLs whose bodies belong in the PDF, in desired order.")
+    e = commands.add_parser("export", help="Write UTF-8 TXT (or requested PDF) and attachments, including nested EMLs, into the same folder.")
+    e.add_argument("emls", nargs="+", help="EMLs whose bodies belong in the output, in desired order.")
     e.add_argument("--attachments-from", nargs="*", default=[], help="Older EMLs whose unique attachments should also be extracted.")
     e.add_argument("--out", help="Existing output directory; defaults to the first EML's directory.")
-    e.add_argument("--pdf-name", help="Output PDF basename ending in .pdf; defaults to the first EML's stem.")
+    e.add_argument("--format", choices=("txt", "pdf"), default="txt", help="Conversion format; defaults to txt. PDF requires Chrome/Edge.")
+    e.add_argument("--output-name", "--pdf-name", dest="output_name", help="Output basename with the selected extension; defaults to the first EML's stem.")
     e.add_argument("--browser", help="Optional Chrome/Edge executable.")
     e.add_argument("--include-inline-images", action="store_true", help="Also save inline MIME images as standalone files.")
-    e.add_argument("--omit-redundant-plain", action="store_true", help="Omit plain MIME alternative only after reviewing that HTML preserves its content and link/image targets.")
+    e.add_argument("--omit-redundant-plain", action="store_true", help="PDF only: omit plain MIME alternative after reviewing that HTML preserves its content and link/image targets.")
     args = parser.parse_args()
     try:
         print(json.dumps(scan(args) if args.command == "scan" else export(args), ensure_ascii=False))

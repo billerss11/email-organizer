@@ -44,7 +44,7 @@ def run(root):
     (root / "existing-copy.bin").write_bytes(b"identical")
     args = Namespace(emls=[str(root / "new.eml")], attachments_from=[str(root / "old.eml")],
                      out=None, pdf_name=None, browser=None, include_inline_images=False,
-                     omit_redundant_plain=False)
+                     omit_redundant_plain=False, format="pdf")
     result = ef.export(args)
     assert result["unique_attachments"] == 5
     json.dumps(result)
