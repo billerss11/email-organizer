@@ -1,4 +1,4 @@
 interface:
   display_name: "Email Organizer"
   short_description: "Extract attachments, create PDFs, and deduplicate emails"
-  default_prompt: "Use $email-organizer to organize these EML files, save all unique attachments, and retain the newest complete email chains."
+  default_prompt: "Use $email-organizer to extract attachments and create PDFs in the same folder, then clean up older duplicate email chains without organizing files into folders."

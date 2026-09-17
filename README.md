@@ -1,21 +1,19 @@
 # Email Organizer
 
-A compact Codex skill for local email archives:
+A compact Codex skill for a flat email-file workflow:
 
-- Extract attachments from EML files; deduplicate identical bytes.
-- Create searchable PDFs with email headers, quotations, tables, and embedded images.
-- Compare specified EML/PDF files and retain the newest complete conversation.
-- Preserve unique older attachments and separate reply branches.
-- Move confirmed redundant files to a recovery folder; leave uncertain matches intact.
+- Extract attachments into the same folder, keeping original filenames.
+- Convert email chains to PDFs beside their EML files.
+- Remove proven older duplicate chains after preserving unique information.
 
-Codex evaluates thread relationships and performs requested cleanup. The helper only scans and exports; it never deletes inputs. Original EMLs are preserved in each export's `sources/` folder. External images are not downloaded. HTML is reflowed for readability.
+No conversation folders, attachment folders, backup copies, manifests, or organization reports. Inline signature images stay inside PDFs. Identical attachments are reused; filename conflicts preserve both versions. ZIPs stay intact. Current EMLs remain in place. Codex reviews duplicate chains and uses the system Recycle Bin for cleanup; the helper never deletes inputs.
 
 ## Use
 
 Place this repository at `~/.codex/skills/email-organizer`, then invoke:
 
-> Use $email-organizer on these EML files. Compare with this archive folder, save unique attachments, convert complete chains to PDF, and clean up older redundant copies.
+> Use $email-organizer to extract attachments and make PDFs in this same folder. Clean up older duplicate email chains. Do not organize anything into folders.
 
 Requires Python 3.10+, the packages in `requirements.txt`, and Chrome or Edge. Prefer an existing non-base environment, such as `codex_env`. Run `python scripts/email_files.py --help` for helper commands. Run `python tests/smoke.py` for the synthetic smoke test.
 
-Only skill instructions, code, and synthetic tests belong in this repository. Store real emails, attachments, generated PDFs, and manifests elsewhere. See [SKILL.md](SKILL.md) for the workflow.
+Keep real email data and runtime output out of this repository. See [SKILL.md](SKILL.md) for the workflow.

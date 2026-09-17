@@ -2,7 +2,6 @@
 """Inspect local EML/PDF files; export EMLs and attachments without changing sources."""
 import argparse
 import base64
-from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
@@ -77,7 +76,8 @@ def read_eml(path):
             attachments.append({"name": str(part.get_filename() or f"part-{location}{ext}"),
                                 "mime": mime, "sha256": digest(data), "bytes": len(data),
                                 "cid": str(part.get("Content-ID", "")).strip("<>"),
-                                "location": location, "inline": part.get_content_disposition() == "inline",
+                                "location": location, "disposition": part.get_content_disposition() or "",
+                                "inline": part.get_content_disposition() == "inline",
                                 "_scope": scope, "_body_resource": not in_attachment,
                                 "data": data})
         if part.is_multipart():
@@ -192,7 +192,8 @@ def sanitized_body(record):
         record["warnings"].append("Unsupported active/vector/form content omitted; inspect and retain source.")
     for tag in list(soup.find_all(["script", "style", "iframe", "object", "embed", "link", "meta", "base", "svg", "input", "head"])):
         tag.decompose()
-    inline = {a["cid"]: a for a in record["attachments"] if a["cid"] and a["_body_resource"] and a["_scope"] == record["_body_scope"]}
+    inline = {a["cid"]: a for a in record["attachments"]
+              if a["cid"] and a["_body_resource"] and a["_scope"] == record["_body_scope"]}
     for tag in list(soup.find_all(True)):
         if tag.name not in ALLOWED_TAGS:
             tag.unwrap()
@@ -258,8 +259,54 @@ def render_pdf(html_path, pdf_path, browser):
         raise RuntimeError("PDF has no pages.")
 
 
+def attachment_target(out, attachment, saved, reserved):
+    """Return one flat output path per byte-identical attachment."""
+    sha = attachment["sha256"]
+    if sha in saved:
+        target = saved[sha]
+        if target.is_symlink() or not target.is_file() or digest(target.read_bytes()) != sha:
+            raise RuntimeError(f"Previously matched attachment changed: {target}")
+        return target
+    name = safe_name(attachment["name"])
+    suffix = Path(name).suffix
+    stem = name[:-len(suffix)] if suffix else name
+    candidates = [out / name] + [out / f"{stem}-{sha[:length]}{suffix}" for length in (8, 12, 16, 64)]
+    for target in candidates:
+        if target in reserved:
+            continue
+        if os.path.lexists(target):
+            if not target.is_symlink() and target.is_file() and digest(target.read_bytes()) == sha:
+                saved[sha] = target
+                return target
+            continue
+        try:
+            with target.open("xb") as destination:
+                destination.write(attachment["data"])
+        except FileExistsError:
+            continue
+        if target.is_symlink() or not target.is_file() or digest(target.read_bytes()) != sha:
+            raise RuntimeError(f"Attachment hash verification failed: {target}")
+        saved[sha] = target
+        return target
+    raise RuntimeError(f"Could not choose a unique attachment name for {name}.")
+
+
 def export(args):
-    browser = find_browser(args.browser)
+    first = Path(args.emls[0]).resolve(strict=True)
+    if first.suffix.lower() != ".eml":
+        raise ValueError("Export accepts EML sources only.")
+    out = Path(args.out).resolve(strict=True) if getattr(args, "out", None) else first.parent
+    if not out.is_dir():
+        raise ValueError("--out must be an existing directory.")
+    pdf_name = getattr(args, "pdf_name", None) or (first.stem + ".pdf")
+    if Path(pdf_name).name != pdf_name or Path(pdf_name).suffix.lower() != ".pdf" or safe_name(pdf_name) != pdf_name:
+        raise ValueError("--pdf-name must be a safe basename ending in .pdf.")
+    pdf_path = out / pdf_name
+    # Refuse before parsing or extracting attachments, so a repeated run creates no clutter.
+    if pdf_path.exists():
+        raise FileExistsError(f"Destination PDF already exists: {pdf_path}")
+
+    browser = find_browser(getattr(args, "browser", None))
     records, by_path = [], {}
     for name in args.emls + args.attachments_from:
         path = Path(name).resolve(strict=True)
@@ -273,37 +320,16 @@ def export(args):
     if omit_plain:
         for record in included:
             record["warnings"] = [w for w in record["warnings"] if not w.startswith("Plain MIME alternative contains")]
-    out = Path(args.out).resolve()
-    out.mkdir(parents=True, exist_ok=False)
-    (out / "attachments").mkdir()
-    (out / "sources").mkdir()
-    saved = {}
-    for record in records:
-        source = out / "sources" / (record["sha256"][:16] + "--" + safe_name(Path(record["path"]).name))
-        if source.exists() and digest(source.read_bytes()) != record["sha256"]:
-            raise RuntimeError("Source filename collision.")
-        source.write_bytes(record["raw"])
-        record["saved_source"] = str(source.relative_to(out))
-        for attachment in record["attachments"]:
-            sha = attachment["sha256"]
-            if sha not in saved:
-                target = out / "attachments" / (sha[:16] + "--" + safe_name(attachment["name"]))
-                if target.exists() and digest(target.read_bytes()) != sha:
-                    raise RuntimeError("Attachment filename collision.")
-                target.write_bytes(attachment["data"])
-                saved[sha] = str(target.relative_to(out))
-            attachment["saved_as"] = saved[sha]
     sections = []
     for record in included:
-        header_rows = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in record["headers"].items() if v)
-        attachment_rows = "".join("<li>" + html.escape(a["name"]) + f" ({a['bytes']} bytes) - " + html.escape(a["saved_as"]) + "</li>" for a in record["attachments"])
+        header_rows = "".join(
+            f"<tr><th>{html.escape(k)}</th><td>{html.escape(record['headers'][k])}</td></tr>"
+            for k in ("From", "To", "Cc", "Bcc", "Date") if record["headers"][k]
+        )
         body = sanitized_body(record)
         if record["plain_has_extra"] and not omit_plain:
             body += '<h2>Plain-text alternative with additional content</h2><pre>' + html.escape(record["plain_alternative"]) + '</pre>'
-        sections.append('<section><h1>' + html.escape(record["headers"]["Subject"] or "Email") + '</h1><table class="headers">' + header_rows + '</table><article>' + body + '</article>' + ('<h2>Files extracted from this email</h2><ul>' + attachment_rows + '</ul>' if attachment_rows else '') + '</section>')
-    all_files = "".join("<li>" + html.escape(name) + "</li>" for name in saved.values())
-    if all_files:
-        sections.append('<section><h1>All preserved attachments</h1><p>Includes attachments from earlier source emails.</p><ul>' + all_files + '</ul></section>')
+        sections.append('<section><h1>' + html.escape(record["headers"]["Subject"] or "Email") + '</h1><table class="headers">' + header_rows + '</table><article>' + body + '</article></section>')
     document = '''<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <style>@page{size:A4;margin:16mm}body{font:11pt Arial,'Microsoft YaHei',sans-serif;color:#171717;line-height:1.45;overflow-wrap:anywhere}
@@ -311,28 +337,44 @@ h1{font-size:17pt}h2{font-size:12pt}section+section{break-before:page}table{bord
 td,th{border:1px solid #bbb;padding:5px;vertical-align:top;overflow-wrap:anywhere}th{text-align:left}.headers{width:100%;font-size:9pt;margin-bottom:20px}.headers th{width:85px}
 pre{white-space:pre-wrap;font-family:inherit;overflow-wrap:anywhere}blockquote{border-left:2px solid #ccc;margin:10px 0;padding-left:12px}img{max-width:100%;max-height:235mm;object-fit:contain}li{overflow-wrap:anywhere}
 </style></head><body>''' + "\n".join(sections) + "</body></html>"
-    pdf_path = out / "conversation.pdf"
     with tempfile.TemporaryDirectory(prefix="email-html-") as temp:
         html_path = Path(temp) / "email.html"
+        temp_pdf = Path(temp) / "email.pdf"
         html_path.write_text(document, encoding="utf-8")
-        render_pdf(html_path, pdf_path, browser)
-    for record in records:
-        if digest((out / record["saved_source"]).read_bytes()) != record["sha256"]:
-            raise RuntimeError("Source copy hash verification failed.")
-    for sha, name in saved.items():
-        if digest((out / name).read_bytes()) != sha:
-            raise RuntimeError("Attachment hash verification failed.")
+        render_pdf(html_path, temp_pdf, browser)
+        reader = PdfReader(temp_pdf)
+        if not "".join(p.extract_text() or "" for p in reader.pages).strip():
+            raise RuntimeError("PDF contains no searchable text.")
+        pages = len(reader.pages)
+
+        saved = {}
+        for path in sorted(out.iterdir()):
+            if not path.is_symlink() and path.is_file() and path != pdf_path:
+                saved.setdefault(digest(path.read_bytes()), path)
+        extracted = {}
+        include_inline = getattr(args, "include_inline_images", False)
+        for record in records:
+            for attachment in record["attachments"]:
+                body_image = attachment["mime"].startswith("image/") and attachment["disposition"] != "attachment" and (attachment["inline"] or (attachment["cid"] and attachment["_body_resource"]))
+                if body_image and not include_inline:
+                    continue
+                target = attachment_target(out, attachment, saved, {pdf_path})
+                item = extracted.setdefault(attachment["sha256"], {
+                    "path": str(target), "sha256": attachment["sha256"], "aliases": []})
+                if attachment["name"] not in item["aliases"]:
+                    item["aliases"].append(attachment["name"])
+        if pdf_path.exists():
+            raise FileExistsError(f"Destination PDF already exists: {pdf_path}")
+        with pdf_path.open("xb") as destination:
+            destination.write(temp_pdf.read_bytes())
+
     reader = PdfReader(pdf_path)
     if not "".join(p.extract_text() or "" for p in reader.pages).strip():
         raise RuntimeError("PDF contains no searchable text.")
-    manifest = {"version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
-                "pdf": "conversation.pdf", "pdf_sha256": digest(pdf_path.read_bytes()), "pages": len(reader.pages),
-                "included_sources": [r["path"] for r in included], "sources": [public_record(r) for r in records],
-                "plain_alternative_policy": "omitted_after_content_review" if omit_plain else "preserve_additional_text",
-                "unique_attachments": len(saved), "status": "exported; content/visual review required before cleanup"}
-    save_json(out / "manifest.json", manifest)
-    return {"pdf": str(pdf_path), "manifest": str(out / "manifest.json"), "pages": len(reader.pages),
-            "unique_attachments": len(saved), "warnings": sorted(set(w for r in records for w in r["warnings"]))}
+    return {"pdf": str(pdf_path), "pdf_sha256": digest(pdf_path.read_bytes()), "pages": pages,
+            "sources": [{"path": r["path"], "sha256": r["sha256"]} for r in records],
+            "attachments": list(extracted.values()), "unique_attachments": len(extracted),
+            "warnings": sorted(set(w for r in records for w in r["warnings"]))}
 
 
 def main():
@@ -342,11 +384,13 @@ def main():
     s.add_argument("inputs", nargs="+")
     s.add_argument("--recursive", action="store_true", help="Include subfolders of specified directories.")
     s.add_argument("--out", required=True, help="New directory for inventory and extracted text.")
-    e = commands.add_parser("export", help="Export selected EML bodies, unique attachments, and original sources.")
+    e = commands.add_parser("export", help="Write a PDF and unique attachments beside the source EMLs or in another existing folder.")
     e.add_argument("emls", nargs="+", help="EMLs whose bodies belong in the PDF, in desired order.")
-    e.add_argument("--attachments-from", nargs="*", default=[], help="Older EMLs to preserve sources/attachments from.")
-    e.add_argument("--out", required=True, help="New directory; existing directories are never overwritten.")
+    e.add_argument("--attachments-from", nargs="*", default=[], help="Older EMLs whose unique attachments should also be extracted.")
+    e.add_argument("--out", help="Existing output directory; defaults to the first EML's directory.")
+    e.add_argument("--pdf-name", help="Output PDF basename ending in .pdf; defaults to the first EML's stem.")
     e.add_argument("--browser", help="Optional Chrome/Edge executable.")
+    e.add_argument("--include-inline-images", action="store_true", help="Also save inline MIME images as standalone files.")
     e.add_argument("--omit-redundant-plain", action="store_true", help="Omit plain MIME alternative only after reviewing that HTML preserves its content and link/image targets.")
     args = parser.parse_args()
     try:
